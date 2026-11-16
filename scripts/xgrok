@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Daedalus Development Group
+"""xgrok: scan, draft, queue, approve, post, status. No implicit publishing."""
+import argparse
+from functools import wraps
+import fcntl
+import hashlib
+import hmac
+import os
+import secrets
+import stat
+from datetime import datetime, timezone, timedelta
+
+
+def locked_queue(fn):
+    """Serialize cooperating xgrok writers, including the posting side effect.
+
+    Never unlink the lock file: replacing its inode would split lock ownership.
+    Kernel releases flock even on crash; legacy writers must adopt this lock too.
+    """
+    @wraps(fn)
+    def locked(path, *args, **kwargs):
+        config = read(Path(path) / 'account_config.json')
+        path, _ = account(config['handle'], path)
+        target = queue_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(contained(path, target.parent / '.xgrok_lock'), 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                return fn(path, *args, **kwargs)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    return locked
+from collections import Counter
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from xgrok_draft import ROOT, account, arguments, contained, now, read, run, validate_item, validate_text, write
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / 'scripts' / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def approval_key(path):
+    target = contained(path, path / '.xgrok_approval_key')
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(secrets.token_hex(32) + '\n')
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('Approval key must be a regular 0600 file')
+        value = stream.read().strip()
+    if len(value) != 64:
+        raise ValueError('Invalid approval key')
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        raise ValueError('Invalid approval key') from None
+
+
+def approval_signature(path, item):
+    # Canonical framing avoids ambiguous concatenations; bind target as well.
+    message = json.dumps([item['id'], item['selected_option'], item['reply_text'],
+                          item['approved_at'], item['target_url']],
+                         ensure_ascii=False, separators=(',', ':')).encode()
+    return hmac.new(approval_key(path), message, hashlib.sha256).hexdigest()
+
+
+def queue_path(path):
+    return path / 'reply_targets/reply_queue_current.json'
+
+
+def save_queue(path, data):
+    target = queue_path(path)
+    if target.exists():
+        shutil.copy2(target, str(target) + '.bak')
+    write(target, data)
+
+
+@locked_queue
+def merge(path, drafts, handle):
+    _, config = account(handle, path)
+    if drafts.get('handle') != handle or drafts.get('expected_handle') != config['expected_handle']:
+        raise ValueError('Draft account mismatch')
+    items = drafts['replies']
+    for item in items:
+        validate_item(item)
+    target = queue_path(path)
+    queue = read(target) if target.exists() else {
+        'handle': handle, 'posting_authorization': 'authorized_for_reply_posting',
+        'check_existing_before_posting': True, 'delay_min_seconds': 30,
+        'delay_max_seconds': 60, 'created_at': now(), 'replies': [], 'discovery_stats': {}}
+    if queue.get('handle') != handle:
+        raise ValueError('Queue account mismatch')
+    urls = {r.get('target_url') for r in queue['replies'] if r.get('target_url')}
+    ids = {r.get('id') for r in queue['replies'] if r.get('id')}
+    added = 0
+    for item in items:
+        if item['target_url'] in urls or item['id'] in ids:
+            continue
+        # Legacy runners ignore draft status; failed=True deliberately fences drafts.
+        clean = {k: item[k] for k in ('id', 'target_url', 'source_post_text', 'source_status_id', 'source_author', 'reply_topic', 'target_rationale', 'options', 'model', 'approved_mentions')}
+        clean.update({k: item[k] for k in ('conversation_context', 'context_complete', 'context_stop_reason') if k in item})
+        clean.update(status='draft', approved=False, posted=False, failed=True, reply_text='', character_count=0, reply_base_hash='')
+        queue['replies'].append(clean)
+        urls.add(clean['target_url'])
+        ids.add(clean['id'])
+        added += 1
+    queue['manual_approval_required'] = True
+    save_queue(path, queue)
+    print(json.dumps({'queued': added, 'queue': str(target)}))
+
+
+def scan(path, config, handle):
+    # Do NOT call discover.main(): it writes template replies into the live queue.
+    discover = load('discover_reply_targets')
+    rank = load('rank_reply_targets')
+    if handle not in discover.QUERIES:
+        raise ValueError('No discovery queries configured for this account')
+    discover.PROFILE_DIRS[handle] = Path(config['browser_profile']).expanduser()
+    discover.EXPECTED_HANDLES[handle] = config['expected_handle']
+    data = discover.discover(handle, discover.QUERIES[handle])
+    raw = path / 'reply_targets/xgrok_discovered_latest.json'
+    write(raw, data)
+    existing = read(queue_path(path)) if queue_path(path).exists() else {'replies': []}
+    already = {r['target_url'] for r in existing['replies'] if r.get('posted')}
+    ranked = []
+    for candidate in discover.rank_candidates(data.get('candidates', []), handle):
+        score, reasons = rank.quality_score(candidate, already)
+        if candidate.get('url') in already or 'own_post' in reasons:
+            continue
+        ranked.append(dict(candidate, rank_score=score, rank_reasons=reasons))
+    ranked.sort(key=lambda r: r['rank_score'], reverse=True)
+    out = path / 'reply_targets/ranked_latest.json'
+    write(out, {'handle': handle, 'created_at': now(), 'source_file': str(raw), 'ranked': ranked, 'top_unreplied': ranked})
+    print(json.dumps({'wrote': str(out), 'ranked': len(ranked)}))
+
+
+def observe(path, config, args):
+    from xgrok_observe import checked_url
+    request = dict(command=args.command, browser_profile=config['browser_profile'],
+                   expected_handle=config['expected_handle'])
+    if args.command == 'thread':
+        request['url'] = checked_url(args.url)
+    if args.command == 'feedback':
+        queue = read(queue_path(path)) if queue_path(path).exists() else {'handle': args.handle, 'replies': []}
+        if queue.get('handle') != args.handle:
+            raise ValueError('Queue account mismatch')
+        request['items'] = [dict(id=r.get('id'), reply_url=checked_url(r['reply_url']))
+                            for r in queue['replies'] if r.get('status') == 'posted' and r.get('reply_url')]
+    # As discovery does, use the existing browser venv, not a new dependency.
+    scratch = contained(path, path / 'reply_targets')
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='xgrok-observe-', dir=scratch) as temp:
+        payload = Path(temp) / 'request.json'
+        write(payload, request)
+        result = subprocess.run([str(Path.home() / 'x-deleter/.venv/bin/python'),
+                                 str(Path(__file__).with_name('xgrok_observe.py')),
+                                 '--request', str(payload)], text=True, capture_output=True, timeout=900)
+        if result.returncode:
+            raise RuntimeError('Browser observation failed: ' + result.stderr[-1500:])
+        data = json.loads(result.stdout)
+    data.update(handle=args.handle, expected_handle=config['expected_handle'], created_at=now())
+    if args.command == 'mentions':
+        rank = load('rank_reply_targets')
+        queue = read(queue_path(path)) if queue_path(path).exists() else {'replies': []}
+        already = {r['target_url'] for r in queue['replies'] if r.get('posted')}
+        ranked = []
+        for item in data.pop('candidates'):
+            if item['author'].casefold() == config['expected_handle'].lstrip('@').casefold() or item['url'] in already:
+                continue
+            score, reasons = rank.quality_score(item, already)
+            ranked.append(dict(item, rank_score=score, rank_reasons=reasons))
+        ranked.sort(key=lambda r: r['rank_score'], reverse=True)
+        data.update(ranked=ranked, top_unreplied=ranked)
+        output = path / 'reply_targets/ranked_mentions.json'
+    elif args.command == 'thread':
+        target = data.pop('target')
+        target.update({k: data[k] for k in ('conversation_context', 'context_complete', 'context_stop_reason')})
+        data.update(ranked=[target], top_unreplied=[target])
+        output = path / ('reply_targets/thread_' + target['status_id'] + '.json')
+    else:
+        output = path / ('reply_targets/engagement_' + now()[:10] + '.json')
+    write(output, data)
+    summary = {'wrote': str(output)}
+    if args.command == 'feedback':
+        valid = [r for r in data['replies'] if not r.get('error') and all(r.get(k) is not None for k in ('replies', 'reposts', 'likes'))]
+        valid.sort(key=lambda r: sum(r[k] for k in ('replies', 'reposts', 'likes')), reverse=True)
+        summary.update(observed=len(data['replies']), scored=len(valid),
+                       top=valid[:3], bottom=list(reversed(valid[-3:])))
+    print(json.dumps(summary, indent=2))
+
+
+@locked_queue
+def approve(path):
+    queue = read(queue_path(path))
+    config = read(path / 'account_config.json')
+    if queue.get('handle') not in (config['handle'], config['expected_handle']):
+        raise ValueError('Queue account mismatch')
+    for item in queue['replies']:
+        if not item.get('options') or item.get('posted') or item.get('status') != 'draft':
+            continue
+        validate_item(item)
+        print('\n' + item['id'] + ' ' + item['target_url'])
+        for idx, option in enumerate(item['options'], 1):
+            print('{}: {}\n   {}'.format(idx, option['text'], option['rationale']))
+        choice = input('Select 1–3, s=skip, q=quit: ').strip()
+        if choice == 'q':
+            break
+        if choice not in ('1', '2', '3'):
+            continue
+        item['selected_option'] = int(choice) - 1
+        text = item['options'][item['selected_option']]['text']
+        item.update(reply_text=text, character_count=len(text), reply_base_hash=hashlib.sha256(text.encode()).hexdigest()[:12], approved=True, approved_at=now(), status='approved', failed=True)
+        item['approval_hmac'] = approval_signature(path, item)
+        # Remain fenced from unsafe legacy runners; xgrok post isolates approval.
+        save_queue(path, queue)
+
+
+@locked_queue
+def post(path, config, args):
+    path, config = account(args.handle, path)
+    if args.expected_handle != config['expected_handle']:
+        raise ValueError('--expected-handle must exactly match account configuration')
+    queue = read(queue_path(path))
+    if queue.get('handle') != args.handle:
+        raise ValueError('Queue account mismatch')
+    candidates = [r for r in queue['replies'] if r.get('id') == args.id]
+    if len(candidates) != 1:
+        raise ValueError('Reply ID must uniquely identify an item')
+    item = candidates[0]
+    validate_item(item)
+    if item.get('posted') or item.get('approved') is not True or item.get('status') != 'approved':
+        raise ValueError('Reply must be explicitly approved and unposted')
+    selected = item.get('selected_option')
+    if type(selected) is not int or selected not in range(3) or item['reply_text'] != item['options'][selected]['text']:
+        raise ValueError('Selected text changed after approval')
+    validate_text(item['reply_text'], item['source_post_text'], item.get('approved_mentions', []))
+    if item.get('reply_base_hash') != hashlib.sha256(item['reply_text'].encode()).hexdigest()[:12]:
+        raise ValueError('Approval text hash mismatch')
+    signature = item.get('approval_hmac')
+    if not isinstance(signature, str) or not item.get('approved_at') or not hmac.compare_digest(signature, approval_signature(path, item)):
+        raise ValueError('Approval HMAC mismatch; human re-approval required')
+    limit = config.get('xgrok', {}).get('max_replies_per_day')
+    if limit is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent = 0
+        for record in queue['replies']:
+            if not (record.get('posted') or record.get('status') == 'posted'):
+                continue
+            try:
+                stamp = datetime.fromisoformat(record['posted_at'].replace('Z', '+00:00'))
+                if stamp.tzinfo is None:
+                    raise ValueError('Missing timezone')
+            except (KeyError, TypeError, ValueError):
+                raise ValueError('Posted item has invalid posted_at; reconcile quota history') from None
+            recent += stamp >= cutoff
+        if recent >= limit:
+            raise ValueError('Daily reply limit reached')
+    if not args.yes:
+        if input('Publish this approved reply to @{}? [yes/no] '.format(config['expected_handle'])) != 'yes':
+            return
+    payload = dict(queue, replies=[dict(item, failed=False)], manual_approval_required=True)
+    # Existing browser posting script, isolated to one approved per-account reply.
+    with tempfile.TemporaryDirectory(prefix='xgrok-', dir=path / 'reply_targets') as temp:
+        target = Path(temp) / 'approved.json'
+        write(target, payload)
+        cmd = [str(Path.home() / 'x-deleter/.venv/bin/python'), str(Path.home() / 'x-deleter/scripts/x_rebrand_ddg.py'), 'reply-queue', '--profile-dir', str(Path(config['browser_profile']).expanduser()), '--expected-handle', args.expected_handle, '--queue', str(target)]
+        item['status'] = 'posting_verification_required'
+        save_queue(path, queue)  # Fence before side effects, including timeout/crash.
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=600)
+        # Require exact-target readback, not exit status or a successful click.
+        updated = read(target)
+        outcome = updated['replies'][0]
+        if outcome.get('id') != item['id'] or outcome.get('target_url') != item['target_url']:
+            raise RuntimeError('Posting result target mismatch; manual verification required')
+        item.update({k: v for k, v in outcome.items() if k in ('posted', 'posted_at', 'reply_url', 'verification_status', 'post_error', 'url_capture_failed')})
+        item['status'] = 'posted' if item.get('posted') and item.get('reply_url') else 'verification_required'
+        item['failed'] = True
+        save_queue(path, queue)
+        if result.returncode or item['status'] != 'posted':
+            raise RuntimeError('Posting not verified; item fenced for manual review (no automatic retry)')
+        print(json.dumps({'id': item['id'], 'reply_url': item['reply_url']}))
+
+
+def accounts():
+    root = ROOT / 'accounts'
+    for path in sorted(root.iterdir()):
+        if path.is_dir() and (path / 'account_config.json').is_file() and (path / 'xgrok.json').is_file():
+            if path.is_symlink():
+                raise ValueError('Account directory must not be a symlink')
+            config = read(contained(path, path / 'account_config.json'))
+            handle = config.get('handle')
+            aliases = {str(config.get(k, '')).casefold() for k in ('handle', 'expected_handle')}
+            if path.name.casefold() not in aliases and not (path.name == 'DDGAgents' and handle == 'DaedalusAgents'):
+                raise ValueError('Account directory identity mismatch')
+            checked, config = account(handle, path)
+            yield handle, checked, config
+
+
+def status(path, handle):
+    queue = read(queue_path(path)) if queue_path(path).exists() else {'handle': handle, 'replies': []}
+    if queue.get('handle') != handle:
+        raise ValueError('Queue account mismatch')
+    counts = Counter('posted' if r.get('posted') else r.get('status', 'legacy_pending') for r in queue['replies'])
+    for name in ('draft', 'approved', 'posted'):
+        counts.setdefault(name, 0)
+    last = path / 'reply_targets/xgrok_last_run.json'
+    return {'handle': handle, 'queue': str(queue_path(path)), 'total': len(queue['replies']),
+            'counts': dict(counts), 'last_run': read(last) if last.exists() else None}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest='command', required=True)
+    subs.add_parser('accounts')
+    for name in ('scan', 'mentions', 'thread', 'feedback', 'draft', 'compose', 'queue', 'approve', 'post', 'status'):
+        sub = subs.add_parser(name)
+        if name == 'compose':
+            from xgrok_compose import arguments as compose_arguments
+            compose_arguments(sub)
+            continue
+        if name == 'draft':
+            arguments(sub)
+            sub._option_string_actions['--handle'].required = False
+            sub.add_argument('--all', action='store_true')
+            continue
+        sub.add_argument('--handle', required=name not in ('scan', 'status'))
+        if name in ('scan', 'status'):
+            sub.add_argument('--all', action='store_true')
+        sub.add_argument('--account-dir')
+        if name == 'thread':
+            sub.add_argument('--url', required=True)
+        if name == 'queue':
+            sub.add_argument('--input', required=True)
+        if name == 'post':
+            sub.add_argument('--id', required=True)
+            sub.add_argument('--expected-handle', required=True)
+            sub.add_argument('--yes', action='store_true', help='Skip confirmation, not approval validation')
+    args = parser.parse_args()
+    if args.command == 'accounts' or getattr(args, 'all', False):
+        if getattr(args, 'all', False) and any(getattr(args, key, None) for key in ('handle', 'account_dir', 'input', 'output')):
+            raise ValueError('--all cannot be combined with account-specific paths or handle')
+        for handle, path, config in accounts():
+            if args.command in ('accounts', 'status'):
+                print(json.dumps(status(path, handle)))
+            elif args.command == 'scan':
+                scan(path, config, handle)
+            elif args.command == 'draft':
+                child = argparse.Namespace(**vars(args))
+                child.handle, child.account_dir = handle, str(path)
+                if child.limit < 1:
+                    raise ValueError('--limit must be positive')
+                run(child)
+        return
+    if not args.handle:
+        parser.error('--handle or --all required')
+    path, config = account(args.handle, args.account_dir)
+    if args.command == 'compose':
+        from xgrok_compose import run as compose_run
+        return compose_run(args)
+    if args.command == 'draft':
+        if args.limit < 1:
+            raise ValueError('--limit must be positive')
+        return run(args)
+    if args.command == 'status':
+        print(json.dumps(status(path, args.handle), indent=2))
+        return
+    if args.command in ('mentions', 'thread', 'feedback'):
+        return observe(path, config, args)
+    if args.command == 'scan':
+        scan(path, config, args.handle)
+    elif args.command == 'queue':
+        merge(path, read(args.input), args.handle)
+    elif args.command == 'approve':
+        approve(path)
+    elif args.command == 'post':
+        post(path, config, args)
+    write(path / 'reply_targets/xgrok_last_run.json', {'command': args.command, 'completed_at': now()})
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, KeyError, OSError, RuntimeError, EOFError, subprocess.SubprocessError) as exc:
+        sys.exit(str(exc))

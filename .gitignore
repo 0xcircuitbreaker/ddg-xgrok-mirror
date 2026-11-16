@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+accounts/
+reply_targets/
+queues/
+analytics/
+*.bak
+*.tmp
+.xgrok_approval_key
+.xgrok_lock
+.DS_Store
